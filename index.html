@@ -107,9 +107,71 @@ function computeValidCards(hand,trick,trump){
   }
 }
 function estimateBid(hand,trump){let score=0;hand.forEach(c=>{if(c.suit===trump)score+=c.rank>=12?1.2:0.6;else if(c.rank===14)score+=1;else if(c.rank===13)score+=0.7;});let bid=Math.round(score);return Math.max(1,Math.min(13,bid));}
-function botPickCard(hand,trick,trump){
+
+// ---------- Bot card-counting helpers ----------
+function cardKey(c){ return c.suit+c.rank; }
+function unseenCards(myHand, playedCards){
+  const seen=new Set();
+  myHand.forEach(c=>seen.add(cardKey(c)));
+  (playedCards||[]).forEach(c=>seen.add(cardKey(c)));
+  return newDeck().filter(c=>!seen.has(cardKey(c)));
+}
+// True if no card still unaccounted-for (i.e. sitting in another player's hand) could beat this card if led now.
+function isSafeLead(card, myHand, playedCards, trump){
+  const unseen=unseenCards(myHand, playedCards);
+  if(card.suit===trump){
+    return !unseen.some(c=>c.suit===trump && c.rank>card.rank);
+  }
+  const higherSameSuit=unseen.some(c=>c.suit===card.suit && c.rank>card.rank);
+  const anyTrumpOut=unseen.some(c=>c.suit===trump);
+  return !higherSameSuit && !anyTrumpOut;
+}
+
+function botPickCard(hand,trick,trump,ctx){
+  ctx = ctx || {};
   const valid=computeValidCards(hand,trick,trump);
-  if(trick.length===0){const nonTrump=valid.filter(c=>c.suit!==trump);const pool=nonTrump.length>0?nonTrump:valid;return pool.reduce((a,b)=>a.rank<b.rank?a:b);}
+  if(valid.length===1) return valid[0];
+
+  const bid = ctx.bid;
+  const tricksWon = ctx.tricksWon || 0;
+  const playedCards = ctx.playedCards || [];
+  const ruleMode = ctx.ruleMode || 'local';
+  const hasBidInfo = bid!=null;
+  // How many wins are still "safe" (won't trigger the 2-over penalty)?
+  const maxSafeWins = hasBidInfo ? (ruleMode==='local' ? bid+1 : bid) : Infinity;
+  const wantsToWin = hasBidInfo && tricksWon < bid;
+  const shouldAvoidWinning = hasBidInfo && tricksWon >= maxSafeWins;
+
+  if(trick.length===0){
+    // Leading a fresh trick — full freedom over which card to play.
+    const nonTrump=valid.filter(c=>c.suit!==trump);
+    const pool = nonTrump.length ? nonTrump : valid;
+    if(shouldAvoidWinning){
+      // Prefer a lead that can plausibly be beaten by someone else.
+      const unsafe = pool.filter(c=>!isSafeLead(c, hand, playedCards, trump));
+      const options = unsafe.length ? unsafe : pool;
+      return options.reduce((a,b)=>a.rank<b.rank?a:b);
+    }
+    // Otherwise, try to win cheaply: lead the lowest guaranteed-winning card if one exists.
+    const safeWins = pool.filter(c=>isSafeLead(c, hand, playedCards, trump));
+    if(safeWins.length) return safeWins.reduce((a,b)=>a.rank<b.rank?a:b);
+    if(wantsToWin){
+      const trumps=valid.filter(c=>c.suit===trump);
+      if(trumps.length) return trumps.reduce((a,b)=>a.rank>b.rank?a:b);
+      return valid.reduce((a,b)=>a.rank>b.rank?a:b);
+    }
+    return pool.reduce((a,b)=>a.rank<b.rank?a:b);
+  }
+
+  // Following — the forced-follow/must-beat/must-trump rules already dictate most of this.
+  // Where a genuine choice remains (which specific winning or discard card), prefer to
+  // conserve strength: play the lowest valid card, favoring a non-trump discard when trying
+  // to avoid winning further tricks.
+  if(shouldAvoidWinning){
+    const nonTrump=valid.filter(c=>c.suit!==trump);
+    const pool=nonTrump.length?nonTrump:valid;
+    return pool.reduce((a,b)=>a.rank<b.rank?a:b);
+  }
   return valid.reduce((a,b)=>a.rank<b.rank?a:b);
 }
 function isBotUid(uid){ return typeof uid==='string' && uid.indexOf('bot-')===0; }
@@ -185,7 +247,7 @@ async function doCreate(humanCount){
     players,
     phase:'waiting', round:0, dealSeq:0, dealerSeat:0, trumpChooserSeat:1,
     trumpSuit:null, sideOf:{}, currentTrick:[], leaderSeat:0, trickNum:1,
-    tricksWon:{}, scores:{}, revealedBids:{}, roundScores:{}, history:[],
+    tricksWon:{}, scores:{}, revealedBids:{}, roundScores:{}, history:[], playedCards:[],
     readyPlayers:{}, cancelReason:'', ruleMode:'local', elevenMode:true, redealAttempt:0
   });
   history.replaceState(null,'','?room='+roomId);
@@ -213,7 +275,7 @@ async function doJoin(){
 function subscribe(){
   roomRef.onSnapshot(snap=>{ room=snap.data(); onRoomChange(); });
   myHandRef.onSnapshot(snap=>{ if(snap.exists){ myHand=snap.data(); } render(); });
-  setInterval(()=>{ if(room) onRoomChange(); }, 100);
+  setInterval(()=>{ if(room) onRoomChange(); }, 1000);
 }
 
 function onRoomChange(){
@@ -228,7 +290,7 @@ function onRoomChange(){
     onceAsync('deal-'+seq, performDeal);
   }
   if(room.phase==='cancelled'){
-    onceAsync('redeal-'+(room.redealAttempt||0), ()=>new Promise(res=>setTimeout(()=>performDeal().then(res).catch(res), 100)));
+    onceAsync('redeal-'+(room.redealAttempt||0), ()=>new Promise(res=>setTimeout(()=>performDeal().then(res).catch(res), 200)));
   }
   if(room.phase==='bidding'){
     room.players.forEach(p=>{
@@ -250,12 +312,12 @@ function onRoomChange(){
     if(seat===mySeat() && !optimisticCard){
       const valid=computeValidCards(myHand.cards, room.currentTrick||[], room.trumpSuit);
       if(valid.length===1){
-        onceAsync('autoplay-'+seq+'-'+room.trickNum+'-'+(room.currentTrick||[]).length, ()=>new Promise(res=>setTimeout(()=>{ playCard(valid[0].suit, valid[0].rank).then(res).catch(res); }, 100)));
+        onceAsync('autoplay-'+seq+'-'+room.trickNum+'-'+(room.currentTrick||[]).length, ()=>new Promise(res=>setTimeout(()=>{ playCard(valid[0].suit, valid[0].rank).then(res).catch(res); }, 50)));
       }
     }
   }
   if(room.phase==='playing' && (room.currentTrick||[]).length===4){
-    onceAsync('trickfull-'+seq+'-'+room.trickNum, ()=>new Promise(res=>setTimeout(()=>resolveCurrentTrick().then(res).catch(res),100)));
+    onceAsync('trickfull-'+seq+'-'+room.trickNum, ()=>new Promise(res=>setTimeout(()=>resolveCurrentTrick().then(res).catch(res),2000)));
   }
   if(room.cancelRequest){
     room.players.forEach(p=>{
@@ -306,7 +368,7 @@ async function performDeal(){
     await db.runTransaction(async tx=>{
       const snap=await tx.get(roomRef); const d=snap.data();
       if((d.phase!=='trump' && d.phase!=='cancelled') || d.trumpSuit!==room.trumpSuit) return;
-      tx.update(roomRef, {phase:'bidding', sideOf, tricksWon, revealedBids:{}, currentTrick:[], leaderSeat:d.trumpChooserSeat, trickNum:1, readyPlayers:{}, cancelReason:''});
+      tx.update(roomRef, {phase:'bidding', sideOf, tricksWon, revealedBids:{}, currentTrick:[], leaderSeat:d.trumpChooserSeat, trickNum:1, readyPlayers:{}, cancelReason:'', playedCards:[]});
       room.players.forEach((p,i)=>{ tx.set(roomRef.collection('hands').doc(p.uid), {cards:hands[i], bid:null}); });
     });
   }catch(e){
@@ -333,7 +395,10 @@ async function revealBotBid(uid){
 async function doBotPlay(uid, seat){
   const snap=await roomRef.collection('hands').doc(uid).get();
   const hand=snap.data().cards;
-  const card=botPickCard(hand, room.currentTrick||[], room.trumpSuit);
+  const bid=snap.data().bid;
+  const tricksWon=(room.tricksWon&&room.tricksWon[uid])||0;
+  const playedCards=(room.playedCards||[]).concat((room.currentTrick||[]).map(e=>e.card));
+  const card=botPickCard(hand, room.currentTrick||[], room.trumpSuit, {bid, tricksWon, ruleMode: room.ruleMode, playedCards});
   await executePlay(uid, seat, card, hand);
 }
 
@@ -413,9 +478,10 @@ async function resolveCurrentTrick(){
     if(trick.length!==4) return;
     const winnerEntry=currentWinner(trick, d.trumpSuit);
     const tricksWon={...d.tricksWon}; tricksWon[winnerEntry.uid]=(tricksWon[winnerEntry.uid]||0)+1;
+    const playedCards=(d.playedCards||[]).concat(trick.map(e=>e.card));
     let update;
-    if(d.trickNum>=13){ update={currentTrick:[], leaderSeat:winnerEntry.seat, tricksWon, phase:'collecting'}; }
-    else{ update={currentTrick:[], leaderSeat:winnerEntry.seat, tricksWon, trickNum:d.trickNum+1}; }
+    if(d.trickNum>=13){ update={currentTrick:[], leaderSeat:winnerEntry.seat, tricksWon, playedCards, phase:'collecting'}; }
+    else{ update={currentTrick:[], leaderSeat:winnerEntry.seat, tricksWon, playedCards, trickNum:d.trickNum+1}; }
     tx.update(roomRef, update);
   });
 }
