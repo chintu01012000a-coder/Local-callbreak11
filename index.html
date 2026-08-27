@@ -364,7 +364,7 @@ function onRoomChange(){
     }
   }
   if(room.phase==='playing' && (room.currentTrick||[]).length===4){
-    onceAsync('trickfull-'+seq+'-'+room.trickNum, ()=>new Promise(res=>setTimeout(()=>resolveCurrentTrick().then(res).catch(res),50)));
+    onceAsync('trickfull-'+seq+'-'+room.trickNum, ()=>new Promise(res=>setTimeout(()=>resolveCurrentTrick().then(res).catch(res),1000)));
   }
   if(room.cancelRequest){
     room.players.forEach(p=>{
